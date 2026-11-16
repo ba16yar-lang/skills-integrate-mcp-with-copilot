@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from math import ceil
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
@@ -126,10 +127,11 @@ def _enforce_auth_rate_limit(request: Request, action: str) -> None:
         while attempts and attempts[0] <= cutoff:
             attempts.popleft()
         if len(attempts) >= AUTH_RATE_LIMITS[action]:
+            retry_after = max(1, ceil(attempts[0] + AUTH_RATE_WINDOW_SECONDS - now))
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many authentication attempts. Try again later.",
-                headers={"Retry-After": str(AUTH_RATE_WINDOW_SECONDS)},
+                headers={"Retry-After": str(retry_after)},
             )
         attempts.append(now)
         _auth_attempts[key] = (attempts, now)

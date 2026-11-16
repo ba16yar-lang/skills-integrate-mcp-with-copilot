@@ -1,7 +1,9 @@
 from collections.abc import Iterator
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -141,7 +143,7 @@ def test_registration_and_login_attempts_are_rate_limited(client: TestClient) ->
         json={"email": "last@example.com", "password": "a-secure-password-123"},
     )
     assert limited_registration.status_code == 429
-    assert limited_registration.headers["retry-after"] == "60"
+    assert 1 <= int(limited_registration.headers["retry-after"]) <= auth.AUTH_RATE_WINDOW_SECONDS
 
     client.post(
         "/auth/logout",
@@ -157,3 +159,30 @@ def test_registration_and_login_attempts_are_rate_limited(client: TestClient) ->
         json={"email": "missing@example.com", "password": "a-secure-password-123"},
     )
     assert limited_login.status_code == 429
+
+
+def test_rate_limit_retry_after_reports_remaining_window(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    timestamp = [100.0]
+    monkeypatch.setattr(auth.time, "monotonic", lambda: timestamp[0])
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/auth/register",
+            "raw_path": b"/auth/register",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+    for _ in range(auth.AUTH_RATE_LIMITS["register"]):
+        auth._enforce_auth_rate_limit(request, "register")
+
+    timestamp[0] = 159.0
+    with pytest.raises(HTTPException) as error:
+        auth._enforce_auth_rate_limit(request, "register")
+
+    assert error.value.headers["Retry-After"] == "1"
