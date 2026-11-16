@@ -54,8 +54,12 @@ PostgreSQL is supported with the installed psycopg driver. Set
 cookie's Secure flag. Configure secrets through the deployment environment,
 never in source files.
 
-Authentication recovery/email delivery, verification, rate limiting, account
-deletion/export, and production deployment hardening are not implemented yet.
+Authentication recovery/email delivery, verification, account deletion/export,
+and production deployment hardening remain outstanding.
+Registration and login are currently rate-limited per client address within
+each application process, and concurrent password hashing is bounded. These
+in-memory limits reset on restart and are not a replacement for a shared
+production rate-limiting service.
 The existing `/activities` endpoints remain a public teaching example and are
 not part of the authenticated career platform; do not put personal career data
 in them.

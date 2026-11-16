@@ -6,12 +6,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src import auth
 from src.app import app
 from src.database import Base, get_db
 
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
+    with auth._auth_attempts_lock:
+        auth._auth_attempts.clear()
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -30,6 +33,8 @@ def client() -> Iterator[TestClient]:
     app.dependency_overrides.clear()
     Base.metadata.drop_all(engine)
     engine.dispose()
+    with auth._auth_attempts_lock:
+        auth._auth_attempts.clear()
 
 
 def register(client: TestClient, email: str) -> dict:
@@ -118,3 +123,37 @@ def test_invalid_login_does_not_authenticate(client: TestClient) -> None:
     )
     assert response.status_code == 401
     assert client.get("/auth/me").status_code == 401
+
+
+def test_registration_and_login_attempts_are_rate_limited(client: TestClient) -> None:
+    for index in range(auth.AUTH_RATE_LIMITS["register"]):
+        response = client.post(
+            "/auth/register",
+            json={
+                "email": f"account-{index}@example.com",
+                "password": "a-secure-password-123",
+            },
+        )
+        assert response.status_code == 201
+
+    limited_registration = client.post(
+        "/auth/register",
+        json={"email": "last@example.com", "password": "a-secure-password-123"},
+    )
+    assert limited_registration.status_code == 429
+    assert limited_registration.headers["retry-after"] == "60"
+
+    client.post(
+        "/auth/logout",
+        headers={"X-CSRF-Token": client.get("/auth/csrf").json()["csrf_token"]},
+    )
+    for _ in range(auth.AUTH_RATE_LIMITS["login"]):
+        assert client.post(
+            "/auth/login",
+            json={"email": "missing@example.com", "password": "a-secure-password-123"},
+        ).status_code == 401
+    limited_login = client.post(
+        "/auth/login",
+        json={"email": "missing@example.com", "password": "a-secure-password-123"},
+    )
+    assert limited_login.status_code == 429

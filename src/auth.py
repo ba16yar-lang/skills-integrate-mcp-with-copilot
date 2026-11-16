@@ -3,10 +3,14 @@ import hmac
 import os
 import re
 import secrets
+import threading
+import time
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +23,12 @@ from src.models import User, UserProfile, UserSession
 SESSION_COOKIE = "core456_session"
 SESSION_TTL = timedelta(days=14)
 EMAIL_PATTERN = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
+AUTH_RATE_WINDOW_SECONDS = 60
+AUTH_RATE_LIMITS = {"register": 5, "login": 10}
+MAX_RATE_LIMIT_CLIENTS = 4096
+_auth_attempts: OrderedDict[tuple[str, str], tuple[deque[float], float]] = OrderedDict()
+_auth_attempts_lock = threading.Lock()
+_password_hash_slots = threading.BoundedSemaphore(value=4)
 router = APIRouter(prefix="/auth", tags=["authentication"])
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -100,6 +110,48 @@ def verify_password(password: str, encoded: str) -> bool:
 DUMMY_PASSWORD_HASH = hash_password("constant-time-placeholder-password")
 
 
+def _enforce_auth_rate_limit(request: Request, action: str) -> None:
+    now = time.monotonic()
+    cutoff = now - AUTH_RATE_WINDOW_SECONDS
+    client_host = request.client.host if request.client else "unknown"
+    key = (action, client_host)
+    with _auth_attempts_lock:
+        while _auth_attempts:
+            oldest_key, (_, last_seen) = next(iter(_auth_attempts.items()))
+            if last_seen > cutoff:
+                break
+            _auth_attempts.pop(oldest_key)
+
+        attempts, _ = _auth_attempts.get(key, (deque(), now))
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
+        if len(attempts) >= AUTH_RATE_LIMITS[action]:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many authentication attempts. Try again later.",
+                headers={"Retry-After": str(AUTH_RATE_WINDOW_SECONDS)},
+            )
+        attempts.append(now)
+        _auth_attempts[key] = (attempts, now)
+        _auth_attempts.move_to_end(key)
+        while len(_auth_attempts) > MAX_RATE_LIMIT_CLIENTS:
+            _auth_attempts.popitem(last=False)
+
+
+@contextmanager
+def _password_hash_slot():
+    if not _password_hash_slots.acquire(timeout=2):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Authentication is busy. Try again shortly.",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        yield
+    finally:
+        _password_hash_slots.release()
+
+
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -176,9 +228,13 @@ def require_csrf(
 def register(
     payload: RegisterRequest,
     response: Response,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    user = User(email=payload.email, password_hash=hash_password(payload.password))
+    _enforce_auth_rate_limit(request, "register")
+    with _password_hash_slot():
+        password_hash = hash_password(payload.password)
+    user = User(email=payload.email, password_hash=password_hash)
     user.profile = UserProfile(full_name=payload.full_name.strip(), locale="en-GB")
     db.add(user)
     try:
@@ -195,13 +251,17 @@ def register(
 def login(
     payload: LoginRequest,
     response: Response,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> UserResponse:
+    _enforce_auth_rate_limit(request, "login")
     user = db.scalar(select(User).where(User.email == payload.email))
-    # Perform a scrypt operation even for unknown accounts to reduce timing-based enumeration.
-    if user is None:
-        verify_password(payload.password, DUMMY_PASSWORD_HASH)
-    if not user or not verify_password(payload.password, user.password_hash):
+    with _password_hash_slot():
+        password_matches = verify_password(
+            payload.password,
+            user.password_hash if user else DUMMY_PASSWORD_HASH,
+        )
+    if not user or not password_matches:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     csrf_token = _create_session(db, user, response)
     return _user_response(user, csrf_token)
