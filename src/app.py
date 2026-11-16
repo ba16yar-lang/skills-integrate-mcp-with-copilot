@@ -11,8 +11,14 @@ from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+from src.auth import profile_router, router as auth_router
+
+app = FastAPI(
+    title="CORE456 Career Intelligence API",
+    description="Career platform account API and legacy Mergington activities example",
+)
+app.include_router(auth_router)
+app.include_router(profile_router)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent

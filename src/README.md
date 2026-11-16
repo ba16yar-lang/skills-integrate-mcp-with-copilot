@@ -22,6 +22,46 @@ The existing application and its exercise materials should not be mistaken for
 implemented career features. No production-readiness or product acceptance
 criteria are met by the current code.
 
+## Phase 2 implementation: account foundation
+
+The first Phase 2 increment adds persistent accounts and profiles while keeping
+the legacy activities endpoints separate:
+
+- SQLAlchemy models and an Alembic migration create users, one-to-one profiles,
+  and server-side sessions.
+- `POST /auth/register` and `POST /auth/login` create accounts and establish an
+  opaque, HttpOnly session cookie. Passwords are hashed with scrypt.
+- `GET /auth/me` and `GET /profile/me` return the authenticated user's account
+  and profile. `PUT /profile/me` changes only that user's profile.
+- `GET /auth/csrf` provides the token required in `X-CSRF-Token` for
+  `POST /auth/logout` and profile updates. Logout revokes the server-side
+  session.
+- Email addresses are normalized and unique; registration passwords must be
+  at least 12 characters.
+
+Run the app from the repository root after applying the database migration:
+
+```sh
+python -m pip install -r requirements-dev.txt
+alembic -c src/alembic.ini upgrade head
+uvicorn src.app:app --reload
+```
+
+By default, the database is `./core456.db` in the current working directory.
+Set `DATABASE_URL` to a SQLAlchemy URL to select a different database;
+PostgreSQL is supported with the installed psycopg driver. Set
+`ENVIRONMENT=production` (or `COOKIE_SECURE=true`) behind HTTPS to enable the
+cookie's Secure flag. Configure secrets through the deployment environment,
+never in source files.
+
+Authentication recovery/email delivery, verification, rate limiting, account
+deletion/export, and production deployment hardening are not implemented yet.
+The existing `/activities` endpoints remain a public teaching example and are
+not part of the authenticated career platform; do not put personal career data
+in them.
+
+Focused account tests run with `python -m pytest`.
+
 ## Recommended target architecture
 
 Extend the existing FastAPI service rather than replacing it with a new
@@ -127,8 +167,8 @@ pass.
    stack, data/security gaps, target design, and staged plan. Acceptance:
    architecture and risks are documented without claiming unimplemented
    product features.
-2. **Database, authentication, and user management:** migrations, registration,
-   login/session/recovery, and cross-user isolation tests.
+2. **Database, authentication, and user management (in progress):** migrations,
+   registration, login/session, recovery, and cross-user isolation tests.
 3. **Master CV:** structured editable sections, source-preserving versioning,
    and safe document import with manual review.
 4. **CV builder:** editable/reorderable sections, multiple saved CVs, and
