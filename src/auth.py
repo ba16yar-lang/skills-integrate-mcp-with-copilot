@@ -4,31 +4,30 @@ import os
 import re
 import secrets
 import threading
-import time
-from collections import OrderedDict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from math import ceil
 from typing import Annotated
 
+from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.database import get_db, utcnow_naive
-from src.models import User, UserProfile, UserSession
+from src.models import AuthChallenge, OAuthIdentity, User, UserProfile, UserSession
+from src.security_services import RATE_LIMITS, _attempts, _attempts_lock, enforce_rate_limit, send_account_email
 
 
 SESSION_COOKIE = "core456_session"
 SESSION_TTL = timedelta(days=14)
 EMAIL_PATTERN = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
+CHALLENGE_TTL = timedelta(hours=1)
+AUTH_RATE_LIMITS = RATE_LIMITS
 AUTH_RATE_WINDOW_SECONDS = 60
-AUTH_RATE_LIMITS = {"register": 5, "login": 10}
-MAX_RATE_LIMIT_CLIENTS = 4096
-_auth_attempts: OrderedDict[tuple[str, str], tuple[deque[float], float]] = OrderedDict()
-_auth_attempts_lock = threading.Lock()
+_auth_attempts = _attempts
+_auth_attempts_lock = _attempts_lock
 _password_hash_slots = threading.BoundedSemaphore(value=4)
 router = APIRouter(prefix="/auth", tags=["authentication"])
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
@@ -67,7 +66,8 @@ class LoginRequest(BaseModel):
 
 class UserResponse(BaseModel):
     id: str
-    email: str
+    email: str | None
+    email_verified: bool
     full_name: str
     locale: str
     csrf_token: str | None = None
@@ -86,6 +86,30 @@ class ProfileUpdate(BaseModel):
         if not value:
             raise ValueError("A non-empty name is required")
         return value
+
+
+class EmailRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        value = value.strip().casefold()
+        if not EMAIL_PATTERN.fullmatch(value):
+            raise ValueError("A valid email address is required")
+        return value
+
+
+class TokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=32, max_length=128)
+
+
+class PasswordResetRequest(TokenRequest):
+    new_password: str = Field(min_length=12, max_length=128)
 
 
 def hash_password(password: str) -> str:
@@ -109,35 +133,149 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 DUMMY_PASSWORD_HASH = hash_password("constant-time-placeholder-password")
+_oauth = OAuth()
 
 
-def _enforce_auth_rate_limit(request: Request, action: str) -> None:
-    now = time.monotonic()
-    cutoff = now - AUTH_RATE_WINDOW_SECONDS
-    client_host = request.client.host if request.client else "unknown"
-    key = (action, client_host)
-    with _auth_attempts_lock:
-        while _auth_attempts:
-            oldest_key, (_, last_seen) = next(iter(_auth_attempts.items()))
-            if last_seen > cutoff:
-                break
-            _auth_attempts.pop(oldest_key)
+def _oidc_settings(provider: str) -> dict[str, str] | None:
+    if provider == "google":
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        discovery_url = "https://accounts.google.com/.well-known/openid-configuration"
+    elif provider == "microsoft":
+        client_id = os.getenv("MICROSOFT_CLIENT_ID")
+        client_secret = os.getenv("MICROSOFT_CLIENT_SECRET")
+        tenant = os.getenv("MICROSOFT_TENANT_ID", "common")
+        discovery_url = f"https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration"
+    elif provider == "oidc":
+        client_id = os.getenv("OIDC_CLIENT_ID")
+        client_secret = os.getenv("OIDC_CLIENT_SECRET")
+        discovery_url = os.getenv("OIDC_DISCOVERY_URL", "")
+        if not discovery_url.startswith("https://"):
+            return None
+    else:
+        return None
 
-        attempts, _ = _auth_attempts.get(key, (deque(), now))
-        while attempts and attempts[0] <= cutoff:
-            attempts.popleft()
-        if len(attempts) >= AUTH_RATE_LIMITS[action]:
-            retry_after = max(1, ceil(attempts[0] + AUTH_RATE_WINDOW_SECONDS - now))
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many authentication attempts. Try again later.",
-                headers={"Retry-After": str(retry_after)},
-            )
-        attempts.append(now)
-        _auth_attempts[key] = (attempts, now)
-        _auth_attempts.move_to_end(key)
-        while len(_auth_attempts) > MAX_RATE_LIMIT_CLIENTS:
-            _auth_attempts.popitem(last=False)
+    if not client_id or not client_secret or not discovery_url.startswith("https://"):
+        return None
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "discovery_url": discovery_url,
+    }
+
+
+def _oidc_client(provider: str):
+    settings = _oidc_settings(provider)
+    if not settings:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Identity provider is not configured")
+    client = _oauth.create_client(provider)
+    if client is None:
+        client = _oauth.register(
+            name=provider,
+            client_id=settings["client_id"],
+            client_secret=settings["client_secret"],
+            server_metadata_url=settings["discovery_url"],
+            client_kwargs={"scope": "openid email profile", "code_challenge_method": "S256"},
+        )
+    return client
+
+
+def _oauth_redirect_uri(provider: str) -> str:
+    base_url = os.getenv("OAUTH_REDIRECT_BASE_URL", "").rstrip("/")
+    if not base_url or not (base_url.startswith("https://") or base_url.startswith("http://localhost")):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OAuth redirect URL is not configured",
+        )
+    return f"{base_url}/auth/oauth/{provider}/callback"
+
+
+@router.get("/providers")
+def oauth_providers() -> dict[str, list[str]]:
+    return {"providers": [name for name in ("google", "microsoft", "oidc") if _oidc_settings(name)]}
+
+
+@router.get("/oauth/{provider}")
+async def oauth_start(provider: str, request: Request):
+    _enforce_auth_rate_limit(request, "oauth_start")
+    if not os.getenv("APP_SECRET_KEY") or len(os.getenv("APP_SECRET_KEY", "")) < 32:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OAuth state signing is not configured",
+        )
+    client = _oidc_client(provider)
+    return await client.authorize_redirect(request, _oauth_redirect_uri(provider))
+
+
+@router.get("/oauth/{provider}/callback", name="oauth_callback")
+async def oauth_callback(provider: str, request: Request, response: Response, db: Session = Depends(get_db)):
+    _enforce_auth_rate_limit(request, "oauth_callback")
+    if not os.getenv("APP_SECRET_KEY") or len(os.getenv("APP_SECRET_KEY", "")) < 32:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OAuth state signing is not configured",
+        )
+    client = _oidc_client(provider)
+    try:
+        token = await client.authorize_access_token(request)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Identity sign-in failed") from exc
+
+    claims = token.get("userinfo")
+    if not claims:
+        try:
+            claims = await client.userinfo(token=token)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Identity sign-in failed") from exc
+    issuer = claims.get("iss")
+    subject = claims.get("sub")
+    if not isinstance(issuer, str) or not isinstance(subject, str) or not subject:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Identity sign-in failed")
+
+    identity = db.scalar(
+        select(OAuthIdentity).where(OAuthIdentity.issuer == issuer, OAuthIdentity.subject == subject)
+    )
+    if identity:
+        user = db.get(User, identity.user_id)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Identity sign-in failed")
+    else:
+        email = claims.get("email")
+        email_verified = claims.get("email_verified") is True or claims.get("email_verified") == "true"
+        if not email_verified or not isinstance(email, str) or not EMAIL_PATTERN.fullmatch(email):
+            email = None
+            email_verified = False
+        else:
+            email = email.strip().casefold()
+            if db.scalar(select(User.id).where(User.email == email)):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account with this email already exists. Sign in to link an identity.",
+                )
+        user = User(
+            email=email,
+            password_hash=None,
+            email_verified=email_verified,
+            email_verified_at=utcnow_naive() if email_verified else None,
+        )
+        profile_name = claims.get("name")
+        user.profile = UserProfile(
+            full_name=profile_name[:120] if isinstance(profile_name, str) else "",
+            locale="en-GB",
+        )
+        user.identities.append(OAuthIdentity(issuer=issuer, subject=subject))
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Identity sign-in failed") from exc
+    csrf_token = _create_session(db, user, response)
+    return {
+        "message": "Signed in successfully.",
+        "user": _user_response(user, csrf_token).model_dump(),
+        "redirect": "/static/account.html",
+    }
 
 
 @contextmanager
@@ -154,8 +292,51 @@ def _password_hash_slot():
         _password_hash_slots.release()
 
 
+def _enforce_auth_rate_limit(request: Request, action: str, identifier: str | None = None) -> None:
+    client_host = request.client.host if request.client else "unknown"
+    enforce_rate_limit(action, client_host, identifier)
+
+
 def _token_digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _issue_auth_challenge(db: Session, user: User, purpose: str) -> None:
+    if not user.email:
+        return
+    now = utcnow_naive()
+    db.execute(
+        update(AuthChallenge)
+        .where(
+            AuthChallenge.user_id == user.id,
+            AuthChallenge.purpose == purpose,
+            AuthChallenge.consumed_at.is_(None),
+        )
+        .values(consumed_at=now)
+    )
+    token = secrets.token_urlsafe(32)
+    db.add(
+        AuthChallenge(
+            token_hash=_token_digest(token),
+            user_id=user.id,
+            purpose=purpose,
+            expires_at=now + CHALLENGE_TTL,
+        )
+    )
+    db.commit()
+    base_url = os.getenv("PUBLIC_APP_URL", "http://localhost:8000").rstrip("/")
+    if purpose == "verify_email":
+        subject = "Verify your CORE456 email address"
+        link = f"{base_url}/static/account.html?verify={token}"
+    else:
+        subject = "Reset your CORE456 password"
+        link = f"{base_url}/static/account.html?reset={token}"
+    send_account_email(
+        user.email,
+        subject,
+        f"Use this link within one hour to continue: {link}\n"
+        "If you did not request this, you can ignore this message.",
+    )
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
@@ -192,6 +373,7 @@ def _user_response(user: User, csrf_token: str | None = None) -> UserResponse:
     return UserResponse(
         id=user.id,
         email=user.email,
+        email_verified=user.email_verified,
         full_name=profile.full_name if profile else "",
         locale=profile.locale if profile else "en-GB",
         csrf_token=csrf_token,
@@ -233,10 +415,10 @@ def register(
     request: Request,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    _enforce_auth_rate_limit(request, "register")
+    _enforce_auth_rate_limit(request, "register", payload.email)
     with _password_hash_slot():
         password_hash = hash_password(payload.password)
-    user = User(email=payload.email, password_hash=password_hash)
+    user = User(email=payload.email, password_hash=password_hash, email_verified=False)
     user.profile = UserProfile(full_name=payload.full_name.strip(), locale="en-GB")
     db.add(user)
     try:
@@ -245,8 +427,112 @@ def register(
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists") from exc
+    try:
+        _issue_auth_challenge(db, user, "verify_email")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Verification email could not be sent. Please request another email.",
+        ) from exc
+    return _user_response(user)
+
+
+@router.post("/verify-email", response_model=UserResponse)
+def verify_email(
+    payload: TokenRequest,
+    response: Response,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> UserResponse:
+    _enforce_auth_rate_limit(request, "verify_email", _token_digest(payload.token))
+    challenge = db.scalar(
+        select(AuthChallenge).where(
+            AuthChallenge.token_hash == _token_digest(payload.token),
+            AuthChallenge.purpose == "verify_email",
+            AuthChallenge.consumed_at.is_(None),
+            AuthChallenge.expires_at > utcnow_naive(),
+        )
+    )
+    if not challenge:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link")
+    user = db.get(User, challenge.user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link")
+    challenge.consumed_at = utcnow_naive()
+    user.email_verified = True
+    user.email_verified_at = utcnow_naive()
+    db.commit()
     csrf_token = _create_session(db, user, response)
     return _user_response(user, csrf_token)
+
+
+@router.post("/request-verification", status_code=status.HTTP_202_ACCEPTED)
+def request_verification(
+    payload: EmailRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _enforce_auth_rate_limit(request, "verify_request", payload.email)
+    user = db.scalar(select(User).where(User.email == payload.email))
+    if user and not user.email_verified:
+        try:
+            _issue_auth_challenge(db, user, "verify_email")
+        except Exception:
+            pass
+    return {"message": "If this account needs verification, an email will be sent."}
+
+
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+def forgot_password(
+    payload: EmailRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _enforce_auth_rate_limit(request, "password_reset_request", payload.email)
+    user = db.scalar(select(User).where(User.email == payload.email))
+    if user:
+        try:
+            _issue_auth_challenge(db, user, "reset_password")
+        except Exception:
+            pass
+    return {"message": "If an account exists for this address, password reset instructions will be sent."}
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset_password(
+    payload: PasswordResetRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Response:
+    _enforce_auth_rate_limit(request, "password_reset", _token_digest(payload.token))
+    challenge = db.scalar(
+        select(AuthChallenge).where(
+            AuthChallenge.token_hash == _token_digest(payload.token),
+            AuthChallenge.purpose == "reset_password",
+            AuthChallenge.consumed_at.is_(None),
+            AuthChallenge.expires_at > utcnow_naive(),
+        )
+    )
+    if not challenge:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
+    user = db.get(User, challenge.user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
+    with _password_hash_slot():
+        user.password_hash = hash_password(payload.new_password)
+    user.email_verified = True
+    user.email_verified_at = user.email_verified_at or utcnow_naive()
+    challenge.consumed_at = utcnow_naive()
+    db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.revoked_at.is_(None))
+        .values(revoked_at=utcnow_naive())
+    )
+    db.commit()
+    response.delete_cookie(key=SESSION_COOKIE, path="/", httponly=True, samesite="lax")
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @router.post("/login", response_model=UserResponse)
@@ -256,14 +542,14 @@ def login(
     request: Request,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    _enforce_auth_rate_limit(request, "login")
+    _enforce_auth_rate_limit(request, "login", payload.email)
     user = db.scalar(select(User).where(User.email == payload.email))
     with _password_hash_slot():
         password_matches = verify_password(
             payload.password,
-            user.password_hash if user else DUMMY_PASSWORD_HASH,
+            user.password_hash if user and user.password_hash else DUMMY_PASSWORD_HASH,
         )
-    if not user or not password_matches:
+    if not user or not user.password_hash or not password_matches or not user.email_verified:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     csrf_token = _create_session(db, user, response)
     return _user_response(user, csrf_token)
