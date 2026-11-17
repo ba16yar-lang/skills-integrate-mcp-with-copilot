@@ -45,6 +45,15 @@ The app now includes a first usable ResuMint account and career-data slice:
   CV API validates structured contact, summary, work, education, certification,
   skill, and project data; revision conflicts return HTTP 409, and each save
   creates an immutable revision visible at `/master-cv/revisions/me`.
+- Email/password is the local authentication option. Google, a configured
+  Microsoft Entra tenant, and one generic OIDC provider are optional sign-in
+  choices; each requires credentials and callback registration. OIDC sign-up
+  creates a separate identity and does not automatically link accounts by
+  matching email.
+- Persisted accounts have a server-managed `candidate` role. Master CV
+  operations require both an allowed role permission (RBAC) and an owner match
+  derived from the authenticated session (ABAC). No user-facing role elevation,
+  recruiter access, sharing, or organization/tenant policies are implemented.
 - `/static/account.html` provides email registration/sign-in, recovery,
   provider buttons, and an editable JSON Master CV. The original activities
   demo remains at `/legacy` and `/activities`; its routes are still public and
@@ -112,6 +121,23 @@ migrations, SMTP, Redis, or signing key are missing or inconsistent. Use a
 managed PostgreSQL/Redis service with TLS and backups instead when required by
 your hosting environment. HTTP request bodies are capped at 1 MiB; define and
 test a separate upload limit and storage policy before enabling document import.
+
+### External integration limits
+
+The configured SMTP connection sends account verification and password-recovery
+messages only; it does not connect to a user's mailbox or provide email search,
+sending, or calendar access. Google/Microsoft/OIDC are authentication providers,
+not recruitment-data integrations. No recruitment database, job-board, employer
+website, job-discovery, application-submission, or job-specific CV-tailoring
+connector is currently implemented.
+
+Those integrations require named providers and supported APIs, provider
+credentials, least-privilege scopes, user consent, privacy/retention decisions,
+and testing against provider terms and rate limits. Do not grant the service
+unrestricted mailbox access or scrape sites without authorization. Until these
+integrations and the remaining career features are implemented and tested,
+deployment provides the account and Master CV foundation only; it is not ready
+to apply for jobs or to be represented as the completed ResuMint platform.
 
 This is not yet a complete production career platform: account linking,
 passwordless email login, recovery notifications/monitoring, audit trails,

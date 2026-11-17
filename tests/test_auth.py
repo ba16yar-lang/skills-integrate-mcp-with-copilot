@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src import auth
+from src.authorization import authorize_resource_access
 from src import security_services
 from src.app import app
 from src.database import Base, get_db
+from src.models import User
 
 
 @pytest.fixture
@@ -353,6 +355,30 @@ def test_master_cv_saves_revisions_and_is_user_scoped(
     other_user_cv = client.get("/master-cv/me").json()
     assert other_user_cv["version"] == 0
     assert other_user_cv["content"]["professional_summary"] == ""
+
+
+def test_master_cv_requires_role_permission(
+    client: TestClient, email_outbox: list[tuple[str, str, str]]
+) -> None:
+    user = register(client, "role@example.com", email_outbox)
+    with client.app.state.test_session_factory() as db:
+        account = db.get(User, user["id"])
+        account.role = "unassigned"
+        db.commit()
+
+    assert client.get("/master-cv/me").status_code == 403
+
+
+def test_master_cv_policy_requires_matching_owner() -> None:
+    with pytest.raises(HTTPException) as denied:
+        authorize_resource_access(
+            role="candidate",
+            subject_id="candidate-1",
+            owner_id="candidate-2",
+            permission="master_cv:read",
+        )
+
+    assert denied.value.status_code == 404
 
 
 def test_oversized_request_body_is_rejected(client: TestClient) -> None:
