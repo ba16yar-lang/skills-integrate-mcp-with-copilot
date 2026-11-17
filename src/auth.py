@@ -7,6 +7,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
@@ -30,6 +31,7 @@ AUTH_RATE_WINDOW_SECONDS = 60
 _auth_attempts = _attempts
 _auth_attempts_lock = _attempts_lock
 _password_hash_slots = threading.BoundedSemaphore(value=4)
+_oauth_clients_lock = threading.Lock()
 router = APIRouter(prefix="/auth", tags=["authentication"])
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -145,7 +147,11 @@ def _oidc_settings(provider: str) -> dict[str, str] | None:
     elif provider == "microsoft":
         client_id = os.getenv("MICROSOFT_CLIENT_ID")
         client_secret = os.getenv("MICROSOFT_CLIENT_SECRET")
-        tenant = os.getenv("MICROSOFT_TENANT_ID", "common")
+        tenant = os.getenv("MICROSOFT_TENANT_ID", "")
+        if not tenant or not re.fullmatch(
+            r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?", tenant
+        ) or ".." in tenant:
+            return None
         discovery_url = f"https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration"
     elif provider == "oidc":
         client_id = os.getenv("OIDC_CLIENT_ID")
@@ -169,21 +175,35 @@ def _oidc_client(provider: str):
     settings = _oidc_settings(provider)
     if not settings:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Identity provider is not configured")
-    client = _oauth.create_client(provider)
-    if client is None:
-        client = _oauth.register(
-            name=provider,
-            client_id=settings["client_id"],
-            client_secret=settings["client_secret"],
-            server_metadata_url=settings["discovery_url"],
-            client_kwargs={"scope": "openid email profile", "code_challenge_method": "S256"},
-        )
-    return client
+    with _oauth_clients_lock:
+        client = _oauth.create_client(provider)
+        if client is None:
+            client = _oauth.register(
+                name=provider,
+                client_id=settings["client_id"],
+                client_secret=settings["client_secret"],
+                server_metadata_url=settings["discovery_url"],
+                client_kwargs={"scope": "openid email profile", "code_challenge_method": "S256"},
+            )
+        return client
 
 
 def _oauth_redirect_uri(provider: str) -> str:
     base_url = os.getenv("OAUTH_REDIRECT_BASE_URL", "").rstrip("/")
-    if not base_url or not (base_url.startswith("https://") or base_url.startswith("http://localhost")):
+    parsed = urlsplit(base_url)
+    safe_https = parsed.scheme == "https" and bool(parsed.hostname)
+    safe_local_http = (
+        parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+    )
+    if (
+        not base_url
+        or not (safe_https or safe_local_http)
+        or parsed.username
+        or parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="OAuth redirect URL is not configured",
@@ -242,7 +262,10 @@ async def oauth_callback(provider: str, request: Request, db: Session = Depends(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Identity sign-in failed")
     else:
         email = claims.get("email")
-        email_verified = claims.get("email_verified") is True or claims.get("email_verified") == "true"
+        verified_claim = claims.get("email_verified")
+        email_verified = verified_claim is True or (
+            isinstance(verified_claim, str) and verified_claim.casefold() == "true"
+        )
         if not email_verified or not isinstance(email, str) or not EMAIL_PATTERN.fullmatch(email):
             email = None
             email_verified = False
@@ -325,10 +348,10 @@ def _issue_auth_challenge(db: Session, user: User, purpose: str) -> None:
     base_url = os.getenv("PUBLIC_APP_URL", "http://localhost:8000").rstrip("/")
     if purpose == "verify_email":
         subject = "Verify your ResuMint email address"
-        link = f"{base_url}/static/account.html?verify={token}"
+        link = f"{base_url}/static/account.html#verify={token}"
     else:
         subject = "Reset your ResuMint password"
-        link = f"{base_url}/static/account.html?reset={token}"
+        link = f"{base_url}/static/account.html#reset={token}"
     send_account_email(
         user.email,
         subject,
@@ -544,6 +567,7 @@ def reset_password(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
     with _password_hash_slot():
         user.password_hash = hash_password(payload.new_password)
+    user.credential_version += 1
     user.email_verified = True
     user.email_verified_at = user.email_verified_at or utcnow_naive()
     db.execute(
@@ -566,12 +590,24 @@ def login(
 ) -> UserResponse:
     _enforce_auth_rate_limit(request, "login", payload.email)
     user = db.scalar(select(User).where(User.email == payload.email))
+    password_hash = user.password_hash if user else DUMMY_PASSWORD_HASH
+    credential_version = user.credential_version if user else 0
     with _password_hash_slot():
-        password_matches = verify_password(
-            payload.password,
-            user.password_hash if user and user.password_hash else DUMMY_PASSWORD_HASH,
-        )
+        password_matches = verify_password(payload.password, password_hash or DUMMY_PASSWORD_HASH)
     if not user or not user.password_hash or not password_matches or not user.email_verified:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    credential_is_current = db.execute(
+        update(User)
+        .where(
+            User.id == user.id,
+            User.password_hash == password_hash,
+            User.credential_version == credential_version,
+            User.email_verified.is_(True),
+        )
+        .values(credential_version=User.credential_version)
+    )
+    if credential_is_current.rowcount != 1:
+        db.rollback()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     csrf_token = _create_session(db, user, response)
     return _user_response(user, csrf_token)

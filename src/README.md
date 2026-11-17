@@ -21,50 +21,107 @@ career-management product:
 The existing application and its exercise materials should not be mistaken for
 implemented career features. No production-readiness or product acceptance
 criteria are met by the current code.
+This section records the original repository baseline; the account and CV
+foundation below supersedes its statements about authentication and tests.
 
-## Phase 2 implementation: account foundation
+## Account, identity, and Master CV foundation
 
-The first Phase 2 increment adds persistent accounts and profiles while keeping
-the legacy activities endpoints separate:
+The app now includes a first usable ResuMint account and career-data slice:
 
-- SQLAlchemy models and an Alembic migration create users, one-to-one profiles,
-  and server-side sessions.
-- `POST /auth/register` and `POST /auth/login` create accounts and establish an
-  opaque, HttpOnly session cookie. Passwords are hashed with scrypt.
-- `GET /auth/me` and `GET /profile/me` return the authenticated user's account
-  and profile. `PUT /profile/me` changes only that user's profile.
-- `GET /auth/csrf` provides the token required in `X-CSRF-Token` for
-  `POST /auth/logout` and profile updates. Logout revokes the server-side
-  session.
-- Email addresses are normalized and unique; registration passwords must be
-  at least 12 characters.
+- Email registration requires one-time email verification before password
+  login. Verification and password-reset tokens are high-entropy, stored only
+  as SHA-256 digests, expire after one hour, and are consumed once.
+- `POST /auth/forgot-password` returns the same response for known and unknown
+  addresses. Password reset revokes every active session.
+- Email is delivered through configured SMTP using SSL or STARTTLS.
+- Sign-in/sign-up supports Google, a configured Microsoft Entra tenant, and a
+  generic OpenID Connect discovery endpoint. OAuth authorization-code flow uses
+  signed state, nonce, and PKCE. Provider subjects—not matching email addresses—
+  identify accounts; automatic email-based account linking is prohibited.
+- Redis provides atomic, shared request limits for email, password, recovery,
+  verification, and OIDC endpoints. Local development uses a bounded in-process
+  fallback only; production refuses to start without Redis.
+- Authenticated profile routes and `/master-cv/me` are user-scoped. The Master
+  CV API validates structured contact, summary, work, education, certification,
+  skill, and project data; revision conflicts return HTTP 409, and each save
+  creates an immutable revision visible at `/master-cv/revisions/me`.
+- `/static/account.html` provides email registration/sign-in, recovery,
+  provider buttons, and an editable JSON Master CV. The original activities
+  demo remains at `/legacy` and `/activities`; its routes are still public and
+  must not be used for career data.
 
-Run the app from the repository root after applying the database migration:
+### Local development
 
 ```sh
 python -m pip install -r requirements-dev.txt
 alembic -c src/alembic.ini upgrade head
 uvicorn src.app:app --reload
+python -m pytest
 ```
 
-By default, the database is `./core456.db` in the current working directory.
-Set `DATABASE_URL` to a SQLAlchemy URL to select a different database;
-PostgreSQL is supported with the installed psycopg driver. Set
-`ENVIRONMENT=production` (or `COOKIE_SECURE=true`) behind HTTPS to enable the
-cookie's Secure flag. Configure secrets through the deployment environment,
-never in source files.
+The local default database is `./core456.db`. For email flows, configure
+`SMTP_HOST`, `SMTP_PORT`, `SMTP_STARTTLS` (or `SMTP_SSL`), `EMAIL_FROM`, and any
+SMTP credentials. The app deliberately does not log or return verification or
+reset tokens. Configure OAuth variables to enable provider buttons.
 
-Authentication recovery/email delivery, verification, account deletion/export,
-and production deployment hardening remain outstanding.
-Registration and login are currently rate-limited per client address within
-each application process, and concurrent password hashing is bounded. These
-in-memory limits reset on restart and are not a replacement for a shared
-production rate-limiting service.
-The existing `/activities` endpoints remain a public teaching example and are
-not part of the authenticated career platform; do not put personal career data
-in them.
+## Production deployment: resumint.core456.com
 
-Focused account tests run with `python -m pytest`.
+The repository includes a production-oriented Dockerfile, Compose stack,
+Caddy-managed HTTPS, and `.env.example`. DNS and cloud infrastructure cannot
+be provisioned from this repository. Point `resumint.core456.com` to the host
+and allow inbound TCP ports 80 and 443 so Caddy can issue and renew the TLS
+certificate before accepting production traffic.
+
+1. Install Docker Engine and the Compose plugin on the deployment host.
+2. Copy `.env.example` to `.env`; keep `.env` private and out of version
+   control. Create a 48-character-or-longer `APP_SECRET_KEY` (for example with
+   `openssl rand -hex 32`), a strong URL-safe PostgreSQL password, and a
+   `DATABASE_URL` such as
+   `postgresql+psycopg://<user>:<url-encoded-password>@db:5432/<database>`.
+3. Configure an SMTP provider with SSL or STARTTLS, and set `EMAIL_FROM`.
+   Configure Google/Microsoft/OIDC credentials only for providers you intend to
+   expose. Register exact HTTPS callback URLs:
+   `https://resumint.core456.com/auth/oauth/google/callback`,
+   `https://resumint.core456.com/auth/oauth/microsoft/callback`, and/or
+   `https://resumint.core456.com/auth/oauth/oidc/callback`.
+4. Set `PUBLIC_APP_URL` and `OAUTH_REDIRECT_BASE_URL` exactly to
+   `https://resumint.core456.com`. Set `MICROSOFT_TENANT_ID` to your tenant ID
+   or verified tenant domain. For a third-party OIDC provider, set its HTTPS
+   discovery URL; the issuer and signing keys are validated by Authlib.
+5. Compose includes Caddy, which terminates TLS, redirects HTTP to HTTPS, and
+   forwards the original Host and client address. It uses a fixed container
+   address (`172.30.0.2`) on the Compose network, and Uvicorn trusts only Caddy
+   and loopback. If you change the Compose subnet or use another proxy, change
+   the trusted proxy list to its exact source address. Never use `*`. The app
+   only accepts the configured production Host header.
+6. Build and migrate before starting the service:
+
+   ```sh
+   docker compose build
+   docker compose run --rm app alembic -c src/alembic.ini upgrade head
+   docker compose up -d
+   docker compose ps
+   ```
+
+The Compose file publishes only Caddy's HTTP/HTTPS ports; PostgreSQL and Redis
+are private to the application network. Back up the named database volume,
+monitor `/health/live` and `/health/ready`, rotate provider and SMTP secrets,
+and test restore and account deletion procedures before launch.
+Production startup fails closed if the domain, HTTPS settings, database,
+migrations, SMTP, Redis, or signing key are missing or inconsistent. Use a
+managed PostgreSQL/Redis service with TLS and backups instead when required by
+your hosting environment. HTTP request bodies are capped at 1 MiB; define and
+test a separate upload limit and storage policy before enabling document import.
+
+This is not yet a complete production career platform: account linking,
+passwordless email login, recovery notifications/monitoring, audit trails,
+account export/deletion, file import/export, CV templates/editor beyond the
+structured Master CV, AI, tailoring, ATS, applications, and interview/career
+features still need implementation and end-to-end testing. Do not represent
+the current increment as meeting all final acceptance criteria.
+
+Focused tests run with `python -m pytest`; migration checks should be run with
+Alembic against a disposable database before deployment.
 
 ## Recommended target architecture
 
@@ -172,9 +229,12 @@ pass.
    architecture and risks are documented without claiming unimplemented
    product features.
 2. **Database, authentication, and user management (in progress):** migrations,
-   registration, login/session, recovery, and cross-user isolation tests.
-3. **Master CV:** structured editable sections, source-preserving versioning,
-   and safe document import with manual review.
+   verified registration, login/session, email recovery, OIDC sign-in, shared
+   rate limits, and cross-user isolation tests. Account linking and external
+   email-provider operational testing remain.
+3. **Master CV (in progress):** structured editable sections and immutable
+   revisions are implemented. Safe document import and a polished section
+   editor remain.
 4. **CV builder:** editable/reorderable sections, multiple saved CVs, and
    preview synchronized with saved content.
 5. **Template engine:** at least ten meaningfully distinct layouts, including

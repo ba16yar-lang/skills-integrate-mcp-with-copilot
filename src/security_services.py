@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import smtplib
 import threading
@@ -25,6 +26,7 @@ MAX_RATE_LIMIT_CLIENTS = 4096
 _attempts: OrderedDict[tuple[str, str], tuple[deque[float], float]] = OrderedDict()
 _attempts_lock = threading.Lock()
 _redis_clients = {}
+_redis_clients_lock = threading.Lock()
 _REDIS_WINDOW_SCRIPT = """
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then
@@ -33,6 +35,17 @@ end
 local ttl = redis.call('TTL', KEYS[1])
 return {count, ttl}
 """
+
+
+def get_redis_client(url: str):
+    from redis import Redis
+
+    with _redis_clients_lock:
+        client = _redis_clients.get(url)
+        if client is None:
+            client = Redis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
+            _redis_clients[url] = client
+        return client
 
 
 def _limited(retry_after: int) -> HTTPException:
@@ -65,13 +78,9 @@ def _local_check(key: tuple[str, str], limit: int, now: float) -> None:
 
 
 def _redis_check(url: str, action: str, dimension: str, identifier: str, limit: int) -> None:
-    from redis import Redis
-
-    client = _redis_clients.get(url)
-    if client is None:
-        client = Redis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
-        _redis_clients[url] = client
-    digest = hashlib.sha256(identifier.encode()).hexdigest()
+    client = get_redis_client(url)
+    secret = os.getenv("APP_SECRET_KEY", "local-rate-limit")
+    digest = hmac.new(secret.encode(), identifier.encode(), hashlib.sha256).hexdigest()
     result = client.eval(
         _REDIS_WINDOW_SCRIPT,
         1,
@@ -110,7 +119,8 @@ def enforce_rate_limit(action: str, client_host: str, identifier: str | None = N
 
     _local_check((action, f"ip:{client_host}"), limit, now)
     if identifier:
-        _local_check((action, f"identity:{identifier.casefold()}"), limit, now)
+        digest = hashlib.sha256(identifier.casefold().encode()).hexdigest()
+        _local_check((action, f"identity:{digest}"), limit, now)
 
 
 def send_account_email(recipient: str, subject: str, body: str) -> None:

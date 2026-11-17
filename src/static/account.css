@@ -34,11 +34,13 @@ button:disabled { opacity: .6; cursor: wait; }
 .divider::before, .divider::after { height: 1px; flex: 1; background: #edf0f5; content: ""; }
 .provider-list { display: flex; flex-wrap: wrap; gap: 9px; }
 .provider-button, .secondary-button { border: 1px solid #dfe4ed; background: white; color: #293650; }
+.provider-button { display: inline-flex; align-items: center; padding: 10px 12px; border-radius: 9px; color: #293650; font-size: 13px; font-weight: 650; text-decoration: none; }
 .provider-button:hover, .secondary-button:hover { background: #f6f7fb; }
 .notice { margin: 0 0 18px; padding: 13px 15px; border-radius: 10px; background: #eeefff; color: #38338e; }
 .notice.error { background: #fff0ef; color: #a3312b; }
 .master-card { margin-top: 20px; }
 .section-heading, .save-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.cv-actions { display: flex; gap: 8px; }
 .section-heading h2 { margin-bottom: 0; }
 .master-card > label { margin-top: 20px; }
 textarea { min-height: 360px; resize: vertical; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }

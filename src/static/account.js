@@ -157,6 +157,19 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  document.getElementById("delete-cv").addEventListener("click", async () => {
+    if (!window.confirm("Delete your Master CV and its saved revisions? This cannot be undone.")) return;
+    try {
+      await request("/master-cv/me", { method: "DELETE", headers: { "X-CSRF-Token": csrfToken } });
+      cvVersion = 0;
+      cvEditor.value = "{}";
+      document.getElementById("cv-version").textContent = "No saved Master CV";
+      showMessage("Master CV and revisions deleted.");
+    } catch (error) {
+      showMessage(error.message, true);
+    }
+  });
+
   document.getElementById("logout-button").addEventListener("click", async () => {
     try {
       await request("/auth/logout", { method: "POST", headers: { "X-CSRF-Token": csrfToken } });
@@ -168,8 +181,12 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   const query = new URLSearchParams(window.location.search);
-  if (query.has("verify")) document.querySelector('#verification-form [name="token"]').value = query.get("verify");
-  if (query.has("reset")) document.querySelector('#reset-form [name="token"]').value = query.get("reset");
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  if (fragment.has("verify")) document.querySelector('#verification-form [name="token"]').value = fragment.get("verify");
+  if (fragment.has("reset")) document.querySelector('#reset-form [name="token"]').value = fragment.get("reset");
+  if (fragment.has("verify") || fragment.has("reset")) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  }
   if (query.has("oauth")) showMessage("Identity sign-in complete.");
   loadProviders();
   checkSession();

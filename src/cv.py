@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.auth import get_current_session, require_csrf
 from src.database import get_db, utcnow_naive
-from src.models import MasterCV, UserSession
+from src.models import MasterCV, MasterCVRevision, UserSession
 
 
 class ContactDetails(BaseModel):
@@ -89,6 +89,12 @@ class MasterCVResponse(BaseModel):
     content: MasterCVContent
 
 
+class MasterCVRevisionResponse(BaseModel):
+    version: int
+    created_at: datetime
+    content: MasterCVContent
+
+
 router = APIRouter(prefix="/master-cv", tags=["master CV"])
 EMPTY_CONTENT = MasterCVContent()
 
@@ -107,6 +113,29 @@ def get_master_cv(
         updated_at=record.updated_at,
         content=MasterCVContent.model_validate(record.content),
     )
+
+
+@router.get("/revisions/me", response_model=list[MasterCVRevisionResponse])
+def get_master_cv_revisions(
+    session: Annotated[UserSession, Depends(get_current_session)],
+    db: Session = Depends(get_db),
+) -> list[MasterCVRevisionResponse]:
+    record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
+    if not record:
+        return []
+    revisions = db.scalars(
+        select(MasterCVRevision)
+        .where(MasterCVRevision.master_cv_id == record.id)
+        .order_by(MasterCVRevision.version.desc())
+    ).all()
+    return [
+        MasterCVRevisionResponse(
+            version=item.version,
+            created_at=item.created_at,
+            content=MasterCVContent.model_validate(item.content),
+        )
+        for item in revisions
+    ]
 
 
 @router.put("/me", response_model=MasterCVResponse)
@@ -150,6 +179,15 @@ def save_master_cv(
         )
         db.add(record)
     try:
+        db.flush()
+        db.add(
+            MasterCVRevision(
+                master_cv_id=record.id,
+                version=record.version,
+                content=content,
+                created_at=utcnow_naive(),
+            )
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -164,3 +202,15 @@ def save_master_cv(
         updated_at=record.updated_at,
         content=payload.content,
     )
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+def delete_master_cv(
+    session: Annotated[UserSession, Depends(require_csrf)],
+    db: Session = Depends(get_db),
+) -> Response:
+    record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
+    if record:
+        db.delete(record)
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

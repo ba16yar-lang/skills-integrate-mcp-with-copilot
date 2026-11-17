@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, false, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.database import Base, utcnow_naive
@@ -12,9 +12,14 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
-    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    credential_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, nullable=False)
     profile: Mapped["UserProfile"] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
@@ -95,3 +100,22 @@ class MasterCV(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, nullable=False)
     user: Mapped[User] = relationship(back_populates="master_cv")
+    revisions: Mapped[list["MasterCVRevision"]] = relationship(
+        back_populates="master_cv", cascade="all, delete-orphan", order_by="MasterCVRevision.version"
+    )
+
+
+class MasterCVRevision(Base):
+    __tablename__ = "master_cv_revisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    master_cv_id: Mapped[str] = mapped_column(
+        ForeignKey("master_cvs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, nullable=False)
+    master_cv: Mapped[MasterCV] = relationship(back_populates="revisions")
+    __table_args__ = (
+        UniqueConstraint("master_cv_id", "version", name="uq_master_cv_revision_version"),
+    )
