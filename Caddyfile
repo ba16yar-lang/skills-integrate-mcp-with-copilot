@@ -1,0 +1,4 @@
+resumint.core456.com {
+	encode zstd gzip
+	reverse_proxy app:8000
+}

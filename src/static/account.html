@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Account &amp; Master CV | ResuMint</title>
+    <link rel="stylesheet" href="account.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/static/account.html"><span class="brand-mark">R</span> ResuMint</a>
+      <span class="tagline">Your career, thoughtfully organised</span>
+    </header>
+    <main>
+      <section class="intro">
+        <p class="eyebrow">CAREER INTELLIGENCE</p>
+        <h1>A stronger story starts here.</h1>
+        <p>Create an account, sign in, or continue with a trusted identity provider.</p>
+      </section>
+
+      <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+
+      <div class="columns">
+        <section class="card">
+          <h2>Sign in</h2>
+          <form id="login-form">
+            <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+            <label>Password <input name="password" type="password" autocomplete="current-password" required /></label>
+            <button type="submit">Sign in</button>
+          </form>
+          <form id="forgot-form" class="secondary-form">
+            <label>Email for password reset <input name="email" type="email" autocomplete="email" required /></label>
+            <button class="text-button" type="submit">Email me a reset link</button>
+          </form>
+          <form id="reset-form" class="secondary-form">
+            <label>Reset token <input name="token" autocomplete="one-time-code" required /></label>
+            <label>New password <input name="new_password" type="password" minlength="12" autocomplete="new-password" required /></label>
+            <button class="text-button" type="submit">Set new password</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <h2>Create your account</h2>
+          <form id="register-form">
+            <label>Full name <input name="full_name" autocomplete="name" maxlength="120" /></label>
+            <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+            <label>Password <input name="password" type="password" minlength="12" autocomplete="new-password" required /></label>
+            <button type="submit">Sign up with email</button>
+          </form>
+          <form id="verification-form" class="secondary-form">
+            <label>Verification token <input name="token" autocomplete="one-time-code" required /></label>
+            <button class="text-button" type="submit">Verify email and continue</button>
+          </form>
+          <form id="resend-form" class="secondary-form">
+            <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+            <button class="text-button" type="submit">Resend verification email</button>
+          </form>
+          <div class="divider"><span>or continue with</span></div>
+          <div id="providers" class="provider-list" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <section id="master-cv-card" class="card master-card" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">YOUR SOURCE OF TRUTH</p><h2>Master CV</h2></div>
+          <button id="logout-button" class="secondary-button" type="button">Sign out</button>
+        </div>
+        <p class="muted">Edit structured candidate information. Saving creates a new revision and never changes earlier CV exports.</p>
+        <label for="cv-json">CV data (JSON)</label>
+        <textarea id="cv-json" rows="20" spellcheck="false"></textarea>
+        <div class="save-row"><span id="cv-version" class="muted"></span><div class="cv-actions"><button id="delete-cv" class="secondary-button" type="button">Delete Master CV</button><button id="save-cv" type="button">Save Master CV</button></div></div>
+      </section>
+
+      <footer>Private by design. Your career information is tied to your account.</footer>
+    </main>
+    <script src="account.js"></script>
+  </body>
+</html>
