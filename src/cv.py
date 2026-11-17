@@ -9,8 +9,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.auth import get_current_session, require_csrf
+from src.authorization import authorize_resource_access
 from src.database import get_db, utcnow_naive
-from src.models import MasterCV, MasterCVRevision, UserSession
+from src.models import MasterCV, MasterCVRevision, User, UserSession
 
 
 class ContactDetails(BaseModel):
@@ -99,11 +100,26 @@ router = APIRouter(prefix="/master-cv", tags=["master CV"])
 EMPTY_CONTENT = MasterCVContent()
 
 
+def _authorize_master_cv(
+    session: UserSession, db: Session, owner_id: str, action: str
+) -> None:
+    user = db.get(User, session.user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    authorize_resource_access(
+        role=user.role,
+        subject_id=session.user_id,
+        owner_id=owner_id,
+        permission=f"master_cv:{action}",
+    )
+
+
 @router.get("/me", response_model=MasterCVResponse)
 def get_master_cv(
     session: Annotated[UserSession, Depends(get_current_session)],
     db: Session = Depends(get_db),
 ) -> MasterCVResponse:
+    _authorize_master_cv(session, db, session.user_id, "read")
     record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
     if not record:
         return MasterCVResponse(id=None, version=0, updated_at=None, content=EMPTY_CONTENT)
@@ -120,6 +136,7 @@ def get_master_cv_revisions(
     session: Annotated[UserSession, Depends(get_current_session)],
     db: Session = Depends(get_db),
 ) -> list[MasterCVRevisionResponse]:
+    _authorize_master_cv(session, db, session.user_id, "read")
     record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
     if not record:
         return []
@@ -144,6 +161,7 @@ def save_master_cv(
     session: Annotated[UserSession, Depends(require_csrf)],
     db: Session = Depends(get_db),
 ) -> MasterCVResponse:
+    _authorize_master_cv(session, db, session.user_id, "write")
     record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
     current_version = record.version if record else 0
     if payload.expected_version != current_version:
@@ -209,6 +227,7 @@ def delete_master_cv(
     session: Annotated[UserSession, Depends(require_csrf)],
     db: Session = Depends(get_db),
 ) -> Response:
+    _authorize_master_cv(session, db, session.user_id, "delete")
     record = db.scalar(select(MasterCV).where(MasterCV.user_id == session.user_id))
     if record:
         db.delete(record)

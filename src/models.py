@@ -11,6 +11,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    role: Mapped[str] = mapped_column(String(32), default="candidate", server_default="candidate", nullable=False)
     email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
     email_verified: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false(), nullable=False
