@@ -10,15 +10,26 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import secrets
+from starlette.middleware.sessions import SessionMiddleware
 
 from src.auth import profile_router, router as auth_router
+from src.cv import router as master_cv_router
 
 app = FastAPI(
-    title="CORE456 Career Intelligence API",
+    title="ResuMint Career Intelligence API",
     description="Career platform account API and legacy Mergington activities example",
 )
 app.include_router(auth_router)
 app.include_router(profile_router)
+app.include_router(master_cv_router)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("APP_SECRET_KEY") or secrets.token_urlsafe(32),
+    session_cookie="resumint_oauth_state",
+    same_site="lax",
+    https_only=os.getenv("ENVIRONMENT", "").casefold() == "production",
+)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent

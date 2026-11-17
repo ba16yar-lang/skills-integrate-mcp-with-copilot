@@ -1,4 +1,4 @@
-# CORE456 Career Intelligence — architecture and delivery plan
+# ResuMint — architecture and delivery plan
 
 ## Phase 1: repository assessment
 

@@ -10,6 +10,7 @@ from typing import Annotated
 
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -208,7 +209,7 @@ async def oauth_start(provider: str, request: Request):
 
 
 @router.get("/oauth/{provider}/callback", name="oauth_callback")
-async def oauth_callback(provider: str, request: Request, response: Response, db: Session = Depends(get_db)):
+async def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db)):
     _enforce_auth_rate_limit(request, "oauth_callback")
     if not os.getenv("APP_SECRET_KEY") or len(os.getenv("APP_SECRET_KEY", "")) < 32:
         raise HTTPException(
@@ -270,12 +271,9 @@ async def oauth_callback(provider: str, request: Request, response: Response, db
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Identity sign-in failed") from exc
-    csrf_token = _create_session(db, user, response)
-    return {
-        "message": "Signed in successfully.",
-        "user": _user_response(user, csrf_token).model_dump(),
-        "redirect": "/static/account.html",
-    }
+    redirect = RedirectResponse(url="/static/account.html?oauth=success", status_code=303)
+    _create_session(db, user, redirect)
+    return redirect
 
 
 @contextmanager
@@ -326,10 +324,10 @@ def _issue_auth_challenge(db: Session, user: User, purpose: str) -> None:
     db.commit()
     base_url = os.getenv("PUBLIC_APP_URL", "http://localhost:8000").rstrip("/")
     if purpose == "verify_email":
-        subject = "Verify your CORE456 email address"
+        subject = "Verify your ResuMint email address"
         link = f"{base_url}/static/account.html?verify={token}"
     else:
-        subject = "Reset your CORE456 password"
+        subject = "Reset your ResuMint password"
         link = f"{base_url}/static/account.html?reset={token}"
     send_account_email(
         user.email,
@@ -455,12 +453,24 @@ def verify_email(
     )
     if not challenge:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link")
+    now = utcnow_naive()
+    consumed = db.execute(
+        update(AuthChallenge)
+        .where(
+            AuthChallenge.token_hash == challenge.token_hash,
+            AuthChallenge.consumed_at.is_(None),
+            AuthChallenge.expires_at > now,
+        )
+        .values(consumed_at=now)
+    )
+    if consumed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link")
     user = db.get(User, challenge.user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired verification link")
-    challenge.consumed_at = utcnow_naive()
     user.email_verified = True
-    user.email_verified_at = utcnow_naive()
+    user.email_verified_at = now
     db.commit()
     csrf_token = _create_session(db, user, response)
     return _user_response(user, csrf_token)
@@ -516,6 +526,19 @@ def reset_password(
     )
     if not challenge:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
+    now = utcnow_naive()
+    consumed = db.execute(
+        update(AuthChallenge)
+        .where(
+            AuthChallenge.token_hash == challenge.token_hash,
+            AuthChallenge.consumed_at.is_(None),
+            AuthChallenge.expires_at > now,
+        )
+        .values(consumed_at=now)
+    )
+    if consumed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
     user = db.get(User, challenge.user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link")
@@ -523,7 +546,6 @@ def reset_password(
         user.password_hash = hash_password(payload.new_password)
     user.email_verified = True
     user.email_verified_at = user.email_verified_at or utcnow_naive()
-    challenge.consumed_at = utcnow_naive()
     db.execute(
         update(UserSession)
         .where(UserSession.user_id == user.id, UserSession.revoked_at.is_(None))
